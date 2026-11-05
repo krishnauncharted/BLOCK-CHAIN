@@ -21,6 +21,13 @@ contract MEDwayReservation {
         Both
     }
 
+    enum CapacityLockStatus {
+        None,
+        Active,
+        Converted,
+        Released
+    }
+
     struct Institution {
         bytes32 id;
         string name;
@@ -48,6 +55,33 @@ contract MEDwayReservation {
         address disputedBy;
     }
 
+    struct ResourceInventory {
+        uint32 totalCapacity;
+        uint32 lockedCapacity;
+        uint32 committedCapacity;
+        uint64 updatedAt;
+        bool isActive;
+    }
+
+    struct CapacityLock {
+        bytes32 id;
+        bytes32 resourceType;
+        address provider;
+        address requester;
+        uint32 quantity;
+        uint64 createdAt;
+        uint64 expiresAt;
+        CapacityLockStatus status;
+        bytes32 reservationId;
+    }
+
+    struct ReservationCapacity {
+        address provider;
+        bytes32 resourceType;
+        uint32 quantity;
+        bool active;
+    }
+
     /// @notice Standard dispute window permitted after a reservation is fulfilled (7 days).
     uint64 public constant DISPUTE_WINDOW = 7 days;
 
@@ -64,6 +98,9 @@ contract MEDwayReservation {
 
     bytes32 public constant ACCEPT_REQUEST_TYPEHASH = keccak256(
         "AcceptRequest(bytes32 reservationId,address provider,uint256 nonce,uint256 deadline)"
+    );
+    bytes32 public constant CAPACITY_LOCK_REQUEST_TYPEHASH = keccak256(
+        "CapacityLockRequest(address requester,address provider,bytes32 resourceType,uint32 quantity,uint64 duration,uint256 nonce,uint256 deadline)"
     );
 
     address public immutable owner;
@@ -84,6 +121,11 @@ contract MEDwayReservation {
     mapping(bytes32 => Institution) public institutions;
     mapping(bytes32 => bool) public institutionExists;
     mapping(address => WalletInfo) public wallets;
+
+    mapping(address => mapping(bytes32 => ResourceInventory)) private _resourceInventories;
+    mapping(bytes32 => CapacityLock) public capacityLocks;
+    mapping(bytes32 => bool) public lockExists;
+    mapping(bytes32 => ReservationCapacity) private _reservationCapacity;
 
     // Events - Reservations
     event ReservationCreated(
@@ -131,6 +173,32 @@ contract MEDwayReservation {
         address indexed wallet
     );
 
+    event ResourceInventorySet(
+        address indexed provider,
+        bytes32 indexed resourceType,
+        uint32 totalCapacity,
+        bool isActive
+    );
+    event CapacityLocked(
+        bytes32 indexed lockId,
+        address indexed requester,
+        address indexed provider,
+        bytes32 resourceType,
+        uint32 quantity,
+        uint64 expiresAt
+    );
+    event CapacityLockConverted(
+        bytes32 indexed lockId,
+        bytes32 indexed reservationId,
+        uint32 quantity
+    );
+    event CapacityLockReleased(
+        bytes32 indexed lockId,
+        address indexed provider,
+        uint32 quantity,
+        string reason
+    );
+
     // Errors
     error Unauthorized();
     error InvalidAddress();
@@ -151,6 +219,10 @@ contract MEDwayReservation {
     error WalletNotAuthorized();
     error UnauthorizedRequester();
     error UnauthorizedProvider();
+    error InsufficientCapacity();
+    error InvalidQuantity();
+    error CapacityInactive();
+    error InvalidCapacityLock();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert Unauthorized();
@@ -324,6 +396,197 @@ contract MEDwayReservation {
     }
 
     // -------------------------------------------------------------------
+    // Provider Capacity Inventory and Temporary Reservation Locks
+    // -------------------------------------------------------------------
+
+    /// @notice Set the provider's capacity for one resource type.
+    function setResourceInventory(
+        bytes32 resourceType,
+        uint32 totalCapacity,
+        bool isActive
+    ) external {
+        if (!isProviderWallet(msg.sender)) revert UnauthorizedProvider();
+
+        ResourceInventory storage inventory = _resourceInventories[msg.sender][resourceType];
+        if (totalCapacity < inventory.lockedCapacity + inventory.committedCapacity) {
+            revert InsufficientCapacity();
+        }
+
+        inventory.totalCapacity = totalCapacity;
+        inventory.updatedAt = uint64(block.timestamp);
+        inventory.isActive = isActive;
+        emit ResourceInventorySet(msg.sender, resourceType, totalCapacity, isActive);
+    }
+
+    /// @notice Read the full inventory snapshot expected by the coordination API.
+    function getResourceInventory(
+        address provider,
+        bytes32 resourceType
+    ) external view returns (
+        uint32 totalCapacity,
+        uint32 lockedCapacity,
+        uint32 committedCapacity,
+        uint64 updatedAt,
+        bool isActive
+    ) {
+        ResourceInventory storage inventory = _resourceInventories[provider][resourceType];
+        return (
+            inventory.totalCapacity,
+            inventory.lockedCapacity,
+            inventory.committedCapacity,
+            inventory.updatedAt,
+            inventory.isActive
+        );
+    }
+
+    /// @notice Return unallocated capacity, or zero when the provider is inactive.
+    function getAvailableCapacity(
+        address provider,
+        bytes32 resourceType
+    ) external view returns (uint32) {
+        ResourceInventory storage inventory = _resourceInventories[provider][resourceType];
+        if (!inventory.isActive) return 0;
+        return inventory.totalCapacity - inventory.lockedCapacity - inventory.committedCapacity;
+    }
+
+    /// @notice Hold capacity after a requester authorizes an EIP-712 lock request.
+    function lockCapacityWithSig(
+        address requester,
+        address provider,
+        bytes32 resourceType,
+        uint32 quantity,
+        uint64 duration,
+        uint256 deadline,
+        bytes calldata signature
+    ) external returns (bytes32 lockId) {
+        if (block.timestamp > deadline) revert SignatureExpired();
+        if (quantity == 0 || duration == 0) revert InvalidQuantity();
+        if (!isRequesterWallet(requester)) revert UnauthorizedRequester();
+        if (!isProviderWallet(provider)) revert UnauthorizedProvider();
+
+        uint256 nonce = nonces[requester]++;
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR(),
+                keccak256(
+                    abi.encode(
+                        CAPACITY_LOCK_REQUEST_TYPEHASH,
+                        requester,
+                        provider,
+                        resourceType,
+                        quantity,
+                        duration,
+                        nonce,
+                        deadline
+                    )
+                )
+            )
+        );
+        address recovered = _recoverSigner(digest, signature);
+        if (recovered == address(0) || recovered != requester) revert InvalidSignature();
+
+        ResourceInventory storage inventory = _resourceInventories[provider][resourceType];
+        if (!inventory.isActive) revert CapacityInactive();
+        if (
+            uint256(inventory.lockedCapacity) +
+            inventory.committedCapacity +
+            quantity > inventory.totalCapacity
+        ) revert InsufficientCapacity();
+
+        lockId = keccak256(
+            abi.encode(
+                block.chainid,
+                address(this),
+                requester,
+                provider,
+                resourceType,
+                quantity,
+                nonce
+            )
+        );
+        uint64 expiresAt = uint64(block.timestamp) + duration;
+        lockExists[lockId] = true;
+        capacityLocks[lockId] = CapacityLock({
+            id: lockId,
+            resourceType: resourceType,
+            provider: provider,
+            requester: requester,
+            quantity: quantity,
+            createdAt: uint64(block.timestamp),
+            expiresAt: expiresAt,
+            status: CapacityLockStatus.Active,
+            reservationId: bytes32(0)
+        });
+        inventory.lockedCapacity += quantity;
+        inventory.updatedAt = uint64(block.timestamp);
+
+        emit CapacityLocked(lockId, requester, provider, resourceType, quantity, expiresAt);
+    }
+
+    /// @notice Convert a live capacity hold into a reservation in one transaction.
+    function createReservationWithLock(
+        bytes32 lockId,
+        bytes32 resourceRef,
+        uint64 expiresAt
+    ) external onlyOwner returns (bytes32 reservationId) {
+        if (!lockExists[lockId]) revert InvalidCapacityLock();
+        CapacityLock storage capacityLock = capacityLocks[lockId];
+        if (
+            capacityLock.status != CapacityLockStatus.Active ||
+            block.timestamp >= capacityLock.expiresAt
+        ) revert InvalidCapacityLock();
+
+        reservationId = _createReservationInternal(
+            capacityLock.requester,
+            capacityLock.provider,
+            resourceRef,
+            expiresAt
+        );
+
+        ResourceInventory storage inventory = _resourceInventories[capacityLock.provider][capacityLock.resourceType];
+        inventory.lockedCapacity -= capacityLock.quantity;
+        inventory.committedCapacity += capacityLock.quantity;
+        inventory.updatedAt = uint64(block.timestamp);
+        capacityLock.status = CapacityLockStatus.Converted;
+        capacityLock.reservationId = reservationId;
+        _reservationCapacity[reservationId] = ReservationCapacity({
+            provider: capacityLock.provider,
+            resourceType: capacityLock.resourceType,
+            quantity: capacityLock.quantity,
+            active: true
+        });
+
+        emit CapacityLockConverted(lockId, reservationId, capacityLock.quantity);
+    }
+
+    /// @notice Release a hold early as owner, or permit anyone to clear an expired hold.
+    function releaseLock(bytes32 lockId, string calldata reason) external {
+        if (!lockExists[lockId]) revert InvalidCapacityLock();
+        CapacityLock storage capacityLock = capacityLocks[lockId];
+        if (
+            capacityLock.status != CapacityLockStatus.Active ||
+            (msg.sender != owner && block.timestamp < capacityLock.expiresAt)
+        ) revert Unauthorized();
+
+        ResourceInventory storage inventory = _resourceInventories[capacityLock.provider][capacityLock.resourceType];
+        inventory.lockedCapacity -= capacityLock.quantity;
+        inventory.updatedAt = uint64(block.timestamp);
+        capacityLock.status = CapacityLockStatus.Released;
+        emit CapacityLockReleased(lockId, capacityLock.provider, capacityLock.quantity, reason);
+    }
+
+    function _releaseReservationCapacity(bytes32 reservationId) private {
+        ReservationCapacity storage allocation = _reservationCapacity[reservationId];
+        if (!allocation.active) return;
+
+        ResourceInventory storage inventory = _resourceInventories[allocation.provider][allocation.resourceType];
+        inventory.committedCapacity -= allocation.quantity;
+        inventory.updatedAt = uint64(block.timestamp);
+        allocation.active = false;
+    }
+
+    // -------------------------------------------------------------------
     // Reservation Lifecycle (Enforced by Identity Registry)
     // -------------------------------------------------------------------
 
@@ -488,6 +751,7 @@ contract MEDwayReservation {
 
         r.status = Status.Fulfilled;
         r.fulfilledAt = uint64(block.timestamp);
+        _releaseReservationCapacity(reservationId);
         emit ReservationFulfilled(reservationId, r.fulfilledAt);
     }
 
@@ -504,6 +768,7 @@ contract MEDwayReservation {
         if (block.timestamp >= r.expiresAt) revert InvalidExpiry();
 
         r.status = Status.Cancelled;
+        _releaseReservationCapacity(reservationId);
         emit ReservationCancelled(reservationId, msg.sender);
     }
 
@@ -517,6 +782,7 @@ contract MEDwayReservation {
         if (block.timestamp < r.expiresAt) revert NotExpired();
 
         r.status = Status.Expired;
+        _releaseReservationCapacity(reservationId);
         emit ReservationExpired(reservationId);
     }
 
@@ -564,6 +830,7 @@ contract MEDwayReservation {
         if (resolutionEvidence == bytes32(0)) revert InvalidEvidence();
 
         r.status = resolution;
+        _releaseReservationCapacity(reservationId);
         emit ReservationDisputeResolved(
             reservationId,
             msg.sender,

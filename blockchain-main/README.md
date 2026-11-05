@@ -344,11 +344,21 @@ MEDWAY_CONTRACT_ADDRESS=0xf8a978c5d5dfc258b5aefb4c3ea99b73615b7995
 CORAL_PRIVATE_KEY=0x...
 
 # Persistent Institution Keys (Off-Chain EIP-712 Signers - 0 MST Needed)
-HOSPITAL_A_PRIVATE_KEY=0xdb005ea813f1e7bc63ba1c81cc33b9820502b6a40abfa065b8330fc08f5a607b
+HOSPITAL_A_PRIVATE_KEY=0x...
 HOSPITAL_A_ADDRESS=0x4dB8336edB0af7FeD1311312081689993F80a18B
-LAB_C_PRIVATE_KEY=0x857d17464bde4ab400af5f87be5a92388514649da5d39bc6df9d68c85ae71b8c
+HOSPITAL_B_PRIVATE_KEY=0x...
+HOSPITAL_B_ADDRESS=0x70997970c51812e33987251372ecdbc2b3f3bb6e
+LAB_C_PRIVATE_KEY=0x...
 LAB_C_ADDRESS=0xb05049cc2A5a1c28979DEafc82B82749681DA92C
 ```
+Institution keys must be generated and managed by the institution operator, match
+the configured wallet address, and belong to wallets registered on the deployed
+contract. Never reuse sample keys or put signing keys in frontend code.
+The Coral relayer key must belong to the deployed contract owner and that wallet
+must have a non-zero Coral Testnet balance. The backend health endpoint reports
+relayer readiness; capacity holds and reservation approvals are rejected unless
+the relayer can submit the required on-chain transactions. Keep real keys only
+in the ignored local `backend/.env`, never in this template or source control.
 
 ---
 

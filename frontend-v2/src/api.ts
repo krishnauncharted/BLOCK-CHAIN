@@ -2,6 +2,7 @@ export const BASE: string = import.meta.env.VITE_API_URL ?? '/api'
 
 export type Role = 'requester' | 'provider' | 'arbitrator'
 export interface Actor { id: string; name: string; role: Role }
+export interface InstitutionSession { actor: Actor; authenticated: boolean; mode: 'api_key' | 'demo' }
 export const ACTORS: Actor[] = [
   { id: 'hospital-a', name: 'City Hospital A', role: 'requester' },
   { id: 'hospital-b', name: 'Community Hospital B', role: 'requester' },
@@ -10,7 +11,15 @@ export const ACTORS: Actor[] = [
 ]
 
 export interface Institution { id: string; name: string; type: string; resources: Record<string, number> }
-export interface Offer { provider_id: string; provider_name: string; resource_type: string; available_quantity: number; estimated_delivery_hours: number; rationale: string }
+export interface Offer {
+  provider_id: string
+  provider_name: string
+  resource_type: string
+  available_quantity: number
+  estimated_delivery_hours: number
+  rationale: string
+  onchain_verified?: boolean
+}
 export interface Proposal {
   proposal_id?: string
   request: { requesting_institution_id: string; resource_type: string; quantity: number; urgency: string; required_by_hours: number }
@@ -18,6 +27,11 @@ export interface Proposal {
   selected_provider_id: string | null
   selected_quantity: number
   status: string
+  requires_authorization?: boolean
+  lock_id?: string | null
+  lock_status?: string | null
+  lock_expires_at?: string | null
+  lock_tx_hash?: string | null
 }
 export interface Commitment {
   commitment_id: string
@@ -31,17 +45,20 @@ export interface Commitment {
   tx_hash?: string
   block_number?: number
   onchain_reservation_id?: string
+  lock_id?: string
   dispute_reason?: string
   resolution_notes?: string
   message?: string
   terms_hash?: string
 }
 export interface AuditEvent { id: number; timestamp: number; action: string; actor: string; role: string; event_hash: string; prev_hash: string; details: Record<string, unknown> }
+export interface SystemAuditEvent extends AuditEvent { commitment_id?: string | null }
 export interface EvidenceRecord { id: number; evidence_type: string; raw_document: string; stored_sha256: string; recomputed_sha256: string; integrity_verified: boolean; submitted_by: string; timestamp: number }
 export interface Health {
   status: string
   mode: string
   database: string
+  database_backend?: string
   blockchain: {
     status: string
     network: string
@@ -51,8 +68,29 @@ export interface Health {
     contract_owner?: string
     relayer_configured: boolean
     relayer_address?: string
+    relayer_error?: string
+    capacity_supported?: boolean
+    capacity_error?: string
     institutions_registered?: string[]
+    institution_signers?: Record<string, { name: string; address: string; hasKey: boolean; signerError?: string }>
   }
+}
+
+export interface CapacityStatus {
+  success: boolean
+  provider: string
+  resourceType: string
+  totalCapacity: number
+  lockedCapacity: number
+  committedCapacity: number
+  availableCapacity: number
+  isActive: boolean
+}
+
+export interface InventoryUpdateResult {
+  success: boolean
+  txHash?: string
+  blockNumber?: number
 }
 
 export async function call<T>(path: string, opts: { method?: string; actor?: Actor; key?: string; body?: unknown } = {}): Promise<T> {

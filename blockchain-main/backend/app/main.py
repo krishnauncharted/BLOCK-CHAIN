@@ -5,9 +5,12 @@ from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
+from contextlib import asynccontextmanager
+
 from .agents import discover_and_verify, choose_offer
 from .auth import (
     ActorIdentity,
+    REGISTERED_ACTORS,
     authenticate_actor,
     sync_arbitrator_with_contract_owner,
     verify_authorization_permission,
@@ -18,13 +21,18 @@ from .auth import (
 )
 from .blockchain import (
     get_blockchain_status,
-    create_onchain_reservation,
     accept_onchain_reservation,
     fulfill_onchain_reservation,
     dispute_onchain_reservation,
     resolve_onchain_dispute,
     get_onchain_reservation,
     check_institution_onchain,
+    lock_onchain_capacity,
+    create_reservation_with_lock,
+    release_onchain_lock,
+    get_onchain_lock,
+    get_onchain_capacity,
+    set_onchain_inventory,
 )
 from .data import INSTITUTIONS
 from .db import (
@@ -38,6 +46,10 @@ from .db import (
     record_audit_event,
     get_audit_trail,
     verify_audit_trail_integrity,
+    init_pool,
+    close_pool,
+    init_db,
+    get_active_backend,
 )
 from .models import (
     ResourceRequest,
@@ -45,13 +57,30 @@ from .models import (
     AuthorizationRequest,
     DisputeRequest,
     ResolveDisputeRequest,
+    InventoryUpdateRequest,
+    CapacityLockReleaseRequest,
 )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize connection pool and verify schema during startup
+    init_pool()
+    init_db()
+    try:
+        yield
+    finally:
+        # Gracefully drain and close connection pool on shutdown
+        close_pool()
+
 
 app = FastAPI(
     title="MEDway API",
     description="Autonomous healthcare resource coordination with Coral Testnet on-chain verification and tamper-evident audit trails.",
     version="0.5.0",
+    lifespan=lifespan,
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,10 +146,12 @@ def health():
     if contract_owner:
         sync_arbitrator_with_contract_owner(contract_owner)
 
+    db_engine = get_active_backend()
     return {
         "status": "ok",
         "mode": "hybrid-autonomous-coordination",
-        "database": "sqlite-persistent",
+        "database": f"{db_engine}-persistent",
+        "database_backend": db_engine,
         "blockchain": {
             "status": "connected" if bc_connected else "disconnected",
             "network": bc.get("network", "Coral Testnet"),
@@ -130,8 +161,31 @@ def health():
             "latest_block": bc.get("latestBlock"),
             "relayer_configured": relayer_info.get("configured", False),
             "relayer_address": relayer_info.get("address"),
+            "relayer_error": relayer_info.get("error"),
             "institutions_registered": list(bc.get("registeredInstitutions", {}).keys()),
+            "institution_signers": bc.get("institutionSigners", {}),
+            "capacity_supported": bc.get("capacity", {}).get("supported", False),
+            "capacity_error": bc.get("capacity", {}).get("error"),
         },
+    }
+
+
+@app.get("/session")
+def get_institution_session(
+    x_actor_id: str = Header(..., alias="X-Actor-Id"),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+):
+    """Resolve the selected institution against backend identities without exposing credentials."""
+    actor = authenticate_actor(x_actor_id=x_actor_id, x_api_key=x_api_key)
+    return {
+        "actor": {
+            "id": actor.id,
+            "name": actor.name,
+            "role": actor.role,
+            "address": actor.address,
+        },
+        "authenticated": bool(x_api_key),
+        "mode": "api_key" if x_api_key else "demo",
     }
 
 
@@ -171,14 +225,90 @@ def create_request(
             detail=f"Actor '{actor.id}' is not permitted to submit requests for institution '{request.requesting_institution_id}'. Request payload identity must match authenticated credentials."
         )
 
-    offers = discover_and_verify(request)
+    discovered_offers = discover_and_verify(request)
+    offers = [offer for offer in discovered_offers if offer.onchain_verified]
+    if not offers:
+        raise HTTPException(
+            status_code=503,
+            detail="No provider capacity could be verified on Coral. Check the provider inventory and Coral connection, then retry.",
+        )
     selected = choose_offer(request, offers)
+
+    lock_id = None
+    lock_status = None
+    lock_expires_at = None
+    lock_tx_hash = None
+
+    if selected:
+        # Phase 1: Coordinate temporary on-chain capacity lock to prevent race conditions during human coordinator review
+        lock_res = lock_onchain_capacity(
+            requester=request.requesting_institution_id,
+            provider=selected.provider_id,
+            resource_type=request.resource_type,
+            quantity=request.quantity,
+            duration=1800,  # 30-minute reservation window
+        )
+
+        if lock_res.get("success"):
+            lock_id = lock_res.get("lockId")
+            lock_status = "Active"
+            lock_expires_at = str(lock_res.get("expiresAt"))
+            lock_tx_hash = lock_res.get("txHash")
+
+            record_audit_event(
+                action="CAPACITY_LOCKED",
+                actor=actor.id,
+                role=actor.role,
+                details={
+                    "lock_id": lock_id,
+                    "requester": request.requesting_institution_id,
+                    "provider": selected.provider_id,
+                    "resource_type": request.resource_type,
+                    "quantity": request.quantity,
+                    "tx_hash": lock_tx_hash,
+                    "expires_at": lock_expires_at,
+                },
+            )
+        else:
+            err_msg = lock_res.get("error", "")
+            record_audit_event(
+                action="CAPACITY_LOCK_FAILED",
+                actor=actor.id,
+                role=actor.role,
+                details={
+                    "requesting_institution_id": request.requesting_institution_id,
+                    "provider_id": selected.provider_id,
+                    "quantity": request.quantity,
+                    "error": err_msg,
+                },
+            )
+            if "InsufficientCapacity" in err_msg or "insufficient" in err_msg.lower():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Coral on-chain capacity lock failed: Provider '{selected.provider_id}' has insufficient unallocated capacity."
+                )
+            status_code = 503 if "relayer private key is not configured" in err_msg.lower() else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=f"Could not reserve capacity on Coral: {err_msg or 'The capacity lock transaction failed.'}",
+            )
+
+        if not lock_res.get("lockId") or not lock_res.get("txHash"):
+            raise HTTPException(
+                status_code=502,
+                detail="Coral did not confirm the capacity lock transaction. No allocation proposal was saved.",
+            )
+
     proposal = AllocationProposal(
         request=request,
         offers=offers,
         selected_provider_id=selected.provider_id if selected else None,
         selected_quantity=request.quantity if selected else 0,
         status="proposed",
+        lock_id=lock_id,
+        lock_status=lock_status,
+        lock_expires_at=lock_expires_at,
+        lock_tx_hash=lock_tx_hash,
     )
     proposal_id = str(uuid4())
     payload = proposal.model_dump()
@@ -199,6 +329,7 @@ def create_request(
             "quantity": request.quantity,
             "urgency": request.urgency,
             "selected_provider_id": payload.get("selected_provider_id"),
+            "lock_id": lock_id,
         },
     )
 
@@ -226,7 +357,58 @@ def authorize_proposal(
     )
     verify_authorization_permission(actor, requester_id)
 
+    if proposal.get("status") != "proposed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This allocation proposal is already {proposal.get('status', 'no longer pending')} and cannot be changed.",
+        )
+
     if not approval.approved:
+        # Release temporary capacity lock if present
+        if proposal.get("lock_id"):
+            lock_res = get_onchain_lock(proposal["lock_id"])
+            if not lock_res.get("success"):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not verify the capacity hold on Coral: {lock_res.get('error', 'Unknown blockchain error')}",
+                )
+            if not lock_res.get("exists"):
+                raise HTTPException(status_code=409, detail="The capacity hold no longer exists on Coral.")
+
+            lock_status = lock_res.get("lock", {}).get("status")
+            if lock_status == "Converted":
+                raise HTTPException(status_code=409, detail="This capacity hold has already been converted into a reservation.")
+            if lock_status == "Active":
+                rel_res = release_onchain_lock(
+                    lock_id=proposal["lock_id"],
+                    actor=requester_id,
+                    reason="Coordinator declined allocation proposal",
+                )
+                if not rel_res.get("success"):
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Could not release the capacity hold on Coral: {rel_res.get('error', 'Unknown blockchain error')}",
+                    )
+            elif lock_status != "Released":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"The capacity hold cannot be declined while its Coral status is '{lock_status or 'unknown'}'.",
+                )
+
+            proposal["lock_status"] = "Released"
+            save_proposal(proposal)
+            record_audit_event(
+                action="CAPACITY_LOCK_RELEASED",
+                actor=actor.id,
+                role=actor.role,
+                details={
+                    "proposal_id": proposal_id,
+                    "lock_id": proposal["lock_id"],
+                    "reason": "Coordinator declined proposal",
+                    "tx_hash": rel_res.get("txHash") if lock_status == "Active" else None,
+                },
+            )
+
         proposal["status"] = "cancelled"
         save_proposal(proposal)
         record_audit_event(
@@ -240,8 +422,39 @@ def authorize_proposal(
     if not proposal.get("selected_provider_id"):
         raise HTTPException(status_code=409, detail="No feasible provider offer to authorize")
 
-    proposal["status"] = "authorized"
-    save_proposal(proposal)
+    if not proposal.get("lock_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="This proposal has no on-chain capacity hold. Submit a new capacity request before approving it.",
+        )
+
+    lock_res = get_onchain_lock(proposal["lock_id"])
+    if not lock_res.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not verify the capacity hold on Coral: {lock_res.get('error', 'Unknown blockchain error')}",
+        )
+    if not lock_res.get("exists") or lock_res.get("lock", {}).get("status") != "Active":
+        raise HTTPException(
+            status_code=409,
+            detail="The capacity hold is no longer active on Coral. Submit a new capacity request.",
+        )
+    chain_lock = lock_res["lock"]
+    requester_identity = REGISTERED_ACTORS.get(requester_id)
+    provider_identity = REGISTERED_ACTORS.get(proposal["selected_provider_id"])
+    if (
+        not requester_identity
+        or not provider_identity
+        or not requester_identity.address
+        or not provider_identity.address
+        or chain_lock.get("quantity") != proposal.get("selected_quantity")
+        or chain_lock.get("provider", "").lower() != provider_identity.address.lower()
+        or chain_lock.get("requester", "").lower() != requester_identity.address.lower()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The Coral capacity hold does not match this proposal. No reservation was created.",
+        )
 
     commitment_id = str(uuid4())
     provider_id = proposal["selected_provider_id"]
@@ -259,11 +472,11 @@ def authorize_proposal(
     terms_hash = "0x" + hashlib.sha256(canonical_terms_str.encode("utf-8")).hexdigest()
     resource_ref = terms_hash
 
-    # Attempt on-chain reservation proposal on Coral Testnet via the Viem bridge
-    onchain_res = create_onchain_reservation(
-        requester=requester_id,
-        provider=provider_id,
+    # Phase 2 Commit: atomically convert the verified on-chain lock into a reservation.
+    onchain_res = create_reservation_with_lock(
+        lock_id=proposal["lock_id"],
         resource_ref=resource_ref,
+        expires_in=7200,
     )
 
     commitment = {
@@ -275,6 +488,7 @@ def authorize_proposal(
         "quantity": proposal["selected_quantity"],
         "terms_hash": terms_hash,
         "canonical_terms": terms_payload,
+        "lock_id": proposal.get("lock_id"),
         "status": "authorized",
         "approved_by": approval.approved_by,
         "created_at": None,
@@ -294,6 +508,11 @@ def authorize_proposal(
             status_code=502,
             detail=f"Coral on-chain transaction failed: {onchain_res.get('error', 'Relayed transaction rejected by blockchain')}"
         )
+    if not all(onchain_res.get(field) for field in ("reservationId", "txHash", "blockNumber")):
+        raise HTTPException(
+            status_code=502,
+            detail="Coral did not return a confirmed reservation ID, transaction hash, and block number. Verify the transaction before retrying.",
+        )
 
     commitment["ledger"] = "coral-testnet"
     commitment["onchain_reservation_id"] = onchain_res["reservationId"]
@@ -301,6 +520,22 @@ def authorize_proposal(
     commitment["block_number"] = onchain_res["blockNumber"]
     commitment["onchain_status"] = "Proposed"
     commitment["message"] = f"Commitment registered on Coral Testnet in block #{onchain_res['blockNumber']}"
+
+    proposal["status"] = "authorized"
+    proposal["lock_status"] = "Converted"
+    save_proposal(proposal)
+
+    record_audit_event(
+        action="CAPACITY_LOCK_CONVERTED",
+        actor=actor.id,
+        role=actor.role,
+        details={
+            "proposal_id": proposal_id,
+            "lock_id": proposal["lock_id"],
+            "reservation_id": onchain_res.get("reservationId"),
+            "tx_hash": onchain_res.get("txHash"),
+        },
+    )
 
     # Persist in SQLite ONLY on verified blockchain execution
     save_commitment(commitment)
@@ -318,6 +553,7 @@ def authorize_proposal(
             "onchain_reservation_id": commitment.get("onchain_reservation_id"),
             "tx_hash": commitment.get("tx_hash"),
             "block_number": commitment.get("block_number"),
+            "lock_id": proposal.get("lock_id"),
         },
     )
 
@@ -708,3 +944,139 @@ def verify_audit_log_integrity():
 def get_all_audit_logs(limit: int = 50):
     """Retrieve global system audit events with cryptographic hash chains."""
     return get_audit_trail(limit=limit)
+
+
+# -------------------------------------------------------------------
+# Feature 3: Capacity Inventory & Lock Management Endpoints
+# -------------------------------------------------------------------
+
+
+@app.get("/capacity/{institution_id}/{resource_type}")
+def get_capacity_status(
+    institution_id: str,
+    resource_type: str = "diagnostic_slot",
+):
+    """Query real-time capacity and allocation metrics for a provider directly from Coral Testnet."""
+    res = get_onchain_capacity(provider=institution_id, resource_type=resource_type)
+    if not res.get("success"):
+        if res.get("interrupted"):
+            raise HTTPException(
+                status_code=503,
+                detail="Blockchain query temporarily interrupted by server reload; please retry.",
+            )
+        if "does not support capacity inventory" in res.get("error", ""):
+            raise HTTPException(
+                status_code=503,
+                detail=res["error"],
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to query on-chain capacity: {res.get('error', 'Unknown RPC error')}",
+        )
+    return res
+
+
+@app.post("/inventory")
+def update_provider_inventory(
+    req: InventoryUpdateRequest,
+    x_actor_id: Optional[str] = Header(None, alias="X-Actor-Id"),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+):
+    """
+    Configure total capacity quota for a registered diagnostic provider on Coral Testnet.
+    Enforces that only the designated provider wallet or consortium admin can update capacity.
+    """
+    actor = authenticate_actor(
+        x_actor_id=x_actor_id,
+        x_api_key=x_api_key,
+        default_actor_id=req.provider_id,
+    )
+    if actor.role != "arbitrator" and actor.id != req.provider_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Actor '{actor.id}' is not authorized to set capacity for provider '{req.provider_id}'.",
+        )
+
+    res = set_onchain_inventory(
+        provider=req.provider_id,
+        resource_type=req.resource_type,
+        total_capacity=req.total_capacity,
+        is_active=req.is_active,
+    )
+
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to update on-chain inventory quota: {res.get('error', 'Transaction rejected')}",
+        )
+
+    record_audit_event(
+        action="INVENTORY_QUOTA_UPDATED",
+        actor=actor.id,
+        role=actor.role,
+        details={
+            "provider_id": req.provider_id,
+            "resource_type": req.resource_type,
+            "total_capacity": req.total_capacity,
+            "is_active": req.is_active,
+            "tx_hash": res.get("txHash"),
+            "block_number": res.get("blockNumber"),
+        },
+    )
+
+    return res
+
+
+@app.get("/locks/{lock_id}")
+def inspect_capacity_lock(lock_id: str):
+    """Inspect state and expiration parameters of an on-chain capacity lock."""
+    res = get_onchain_lock(lock_id)
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to query on-chain lock: {res.get('error')}",
+        )
+    if not res.get("exists"):
+        raise HTTPException(status_code=404, detail="Capacity lock not found on Coral Testnet.")
+    return res
+
+
+@app.post("/locks/{lock_id}/release")
+def manual_release_lock(
+    lock_id: str,
+    req: CapacityLockReleaseRequest,
+    x_actor_id: Optional[str] = Header(None, alias="X-Actor-Id"),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+):
+    """Manually release an active capacity lock back to available provider inventory."""
+    actor = authenticate_actor(
+        x_actor_id=x_actor_id,
+        x_api_key=x_api_key,
+        default_actor_id="hospital-a",
+    )
+
+    res = release_onchain_lock(
+        lock_id=lock_id,
+        actor=actor.id,
+        reason=req.reason,
+    )
+
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to release capacity lock on Coral: {res.get('error')}",
+        )
+
+    record_audit_event(
+        action="CAPACITY_LOCK_RELEASED_MANUAL",
+        actor=actor.id,
+        role=actor.role,
+        details={
+            "lock_id": lock_id,
+            "reason": req.reason,
+            "tx_hash": res.get("txHash"),
+            "block_number": res.get("blockNumber"),
+        },
+    )
+
+    return res

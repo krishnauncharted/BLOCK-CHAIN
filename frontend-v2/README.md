@@ -39,12 +39,21 @@ configuration.
    npm run dev
    ```
 
-   Open `http://127.0.0.1:5174`. The institution selector and optional API-key
-   field set the actor headers expected by the backend; entered API keys are held
-   only in browser `sessionStorage`.
+   Open `http://127.0.0.1:5174`. The institution selector is checked against the
+   backend `/session` endpoint before institution-specific actions are enabled;
+   no API key is requested in the frontend.
 
-The frontend includes capacity discovery, coordinator approval, provider acceptance
+The frontend includes capacity discovery, coordinator approval, temporary capacity
+lock details, provider inventory updates and capacity checks, provider acceptance
 and fulfillment, dispute and arbitration actions, on-chain status inspection,
 institution registry checks, and audit/evidence verification.
+
+The inventory and capacity-check controls require a deployed contract artifact with
+the capacity inventory and lock functions used by the updated backend. If the
+configured contract does not expose those functions, the backend reports the error
+in the capacity network instead of showing an unsupported snapshot.
+Coordinator approval also requires a configured Coral relayer; without one, the
+proposal remains available and the UI reports that an on-chain reservation could not
+be submitted.
 
 Run `npm run build` in this directory to type-check and create the production build.
